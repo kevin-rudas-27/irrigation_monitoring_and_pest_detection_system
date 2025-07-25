@@ -1,280 +1,283 @@
-//Configuración con las credenciales de Blynk
-#define BLYNK_TEMPLATE_ID "TMPL2L7YZSNeS"
+// Configuración de Blynk
+#define BLYNK_TEMPLATE_ID "TMPL2Rw9fUfEn"
 #define BLYNK_TEMPLATE_NAME "Proyecto"
-#define BLYNK_AUTH_TOKEN "WIKUFd24YlRzIw56azdoZovxQctooCNb"
-char auth[] = BLYNK_AUTH_TOKEN;
+#define BLYNK_AUTH_TOKEN "ag1kKxsx8MVmwH4ZACsce4Vycj7iuMhY"
 
-//librerias utilizadas
-#include <HardwareSerial.h>
+// Librerias
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <BlynkSimpleEsp32.h>
-#include <DHT.h>
+#include <BlynkSimpleEsp32.h> // uso de blynk
+#include <DHT.h>  // humedad y temperatura ambiental
 
-// Configuración WiFi
-char ssid[] = ""; //Nombre de la red
-char pass[] = "";  //Contraseña de la red
-
-// Configuración DHT11
-#define DHTPIN 4
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
+// Credenciales WiFi
+char ssid[] = ""; // nombre de red
+char pass[] = ""; // contraseña de red
+char auth[] = BLYNK_AUTH_TOKEN;
 
 // Pines virtuales Blynk
 #define TEMP_AMB_VPIN V0
 #define HUM_AMB_VPIN V1
-#define NITROGENO_VPIN V4
-#define FOSFORO_VPIN V5
-#define POTASIO_VPIN V6
-#define HUMEDAD_SUELO_VPIN V2
-#define RELE_CONTROL_VPIN  V3
+#define NITROGENO_VPIN V2
+#define FOSFORO_VPIN V3
+#define POTASIO_VPIN V4
+#define HUMEDAD_SUELO_VPIN V5
+#define RELE_CONTROL_VPIN V6
+#define RELE_STATUS_VPIN V7
 
-// Control de la bomba
-bool modoManualRele = false;    // false = automático, true = manual
-bool estadoManualRele = false;  // estado deseado del relé desde Blynk
+// Configuración DHT11
+#define DHTPIN 4  // pin GPIO4
+#define DHTTIPO DHT11 // sensor
+DHT dht(DHTPIN, DHTTIPO);
 
-// Configuración del puerto serial hardware (UART2)
-HardwareSerial rs485(2);  // Usamos UART2
+//Sensor NPK
+#define SerialPort Serial2
+uint8_t npkTabla[] = {0x01, 0x03, 0x00, 0x1E, 0x00, 0x03, 0x65, 0xCD};
 
-// Parámetros del sensor NPK
-const byte sensorAddress = 0x01;
-const unsigned int baudRate = 4800;
+//Sensor Suelo y Control Rele
+const int sensorSueloPin = 34; // ADC1_CH6 (solo lectura)
+const int pinRele = 19; // GPIO 19
+bool releEstado = false;
+bool releModoManual = false;
+bool humedadSueloConectado = true;
 
-// Direcciones de los registros (hexadecimal)
-const uint16_t nitrogenoReg = 0x001E;
-const uint16_t fosforoReg = 0x001F;
-const uint16_t potasioReg = 0x0020;
+//Variables
+float hum_amb = 0;
+float temp_amb = 0;
+uint16_t nitrogeno = 0;
+uint16_t fosforo = 0;
+uint16_t potasio = 0;
+float humedadSuelo = 0;
+int lecturaRawSuelo = 0;
 
-// Buffer para comunicación
-byte requestFrame[8];
-byte responseFrame[7];
-
-// Variables para almacenar los valores NPK
-uint16_t nitrogenoValor = 0;
-uint16_t fosforoValor = 0;
-uint16_t potasioValor = 0;
-
-// Variables para control de tiempo
+// Control de tiempo
 unsigned long lastDHTRead = 0;
-const unsigned long DHT_INTERVAL = 2000;  // 2 segundos
+unsigned long lastNPKRead = 0;
+unsigned long lastHumedadSueloRead = 0;
+unsigned long lastSendBlynk = 0;
 
-// ========== CONFIGURACIÓN PARA HUMEDAD DE SUELO ==========
-const int sensorSueloPin = 34;   // Entrada analógica para sensor de humedad del suelo (solo lectura)
-const int pinRele = 27;          // Salida digital para controlar relé (no usar GPIO4, 16, 17)
+const unsigned long DHT_INTERVAL = 2000; // 2 seg
+const unsigned long NPK_INTERVAL = 2000; // 2 seg
+const unsigned long SUELO_INTERVAL = 2000; // 2 seg
+const unsigned long BLYNK_INTERVAL = 3000; // 3 seg
 
-float humedadSuelo;
-int lecturaRawSuelo;
-
-// Inicialización del controlador y otros parametros
 void setup() {
-  Serial.begin(115200); //información mediante monitor serial en PC
-  rs485.begin(baudRate, SERIAL_8N1, 16, 17); // RX:16, TX:17 (pines comunes)
-  dht.begin();
-
-  // === CONFIGURACIÓN PARA SENSOR DE HUMEDAD DE SUELO Y RELÉ ===
-  pinMode(pinRele, OUTPUT);
-  digitalWrite(pinRele, LOW);  // Inicia con el relé apagado
+  Serial.begin(115200); // baud monitor serie
   
-  // Conexión WiFi y Blynk
+  // inicializar sensores
+  dht.begin();
+  SerialPort.begin(4800, SERIAL_8N1, 16, 17); // RX=16, TX=17
+  pinMode(pinRele, OUTPUT); // pin salida
+  digitalWrite(pinRele, LOW); // rele apagado
+  pinMode(sensorSueloPin, INPUT_PULLUP);
+
+  //Conexion WiFi
   WiFi.begin(ssid, pass);
-  Serial.print("Conectando a WiFi");
+  Serial.println("===Conectando a WiFi===");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConectado a WiFi!");
-  
+  Serial.println("\nConectado a WiFi");
+
+  //Conexion a Blynk
   Blynk.begin(auth, ssid, pass);
-  Serial.println("Conectando a Blynk...");
+  Serial.println("\n===Conectando a Blynk===");
   while (!Blynk.connected()) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConectado a Blynk!");
-  
-  Serial.println("\nIniciando sistema NPK con ESP32...");
-  Serial.println("Configuracion RS485: 4800 baudios");
-  
-  delay(1000);
+  Serial.println("\nConectado a Blynk");
+  Blynk.logEvent("sistema_online", "Sistema de monitoreo y riego conectado!");
+
+  Serial.println("\nSistema de Monitoreo y Riego iniciado");
+
+  delay(5000);
 }
 
-//Ejecucion del programa
 void loop() {
-  Blynk.run();  // Mantiene la conexión con Blynk
-  
-  // Lectura periódica del sensor DHT11
-  if (millis() - lastDHTRead >= DHT_INTERVAL) {
-    lastDHTRead = millis();
-    
-    //varibles de temperatura y humedad ambiental
-    float hum_amb = dht.readHumidity();
-    float temp_amb = dht.readTemperature();
+  unsigned long currentMillis = millis();
+  Blynk.run();
 
-    if (!isnan(hum_amb) && !isnan(temp_amb)) {
-      Serial.print("Humedad: ");
-      Serial.print(hum_amb);
-      Serial.print("%, Temp: ");
-      Serial.print(temp_amb);
-      Serial.println("°C");
-      
-      // Envío de datos a Blynk
-      Blynk.virtualWrite(HUM_AMB_VPIN, hum_amb);
-      Blynk.virtualWrite(TEMP_AMB_VPIN, temp_amb);
+  // Lectura de sensores
+  if(currentMillis - lastDHTRead >= DHT_INTERVAL) {
+    leerDHT();
+    lastDHTRead = currentMillis;
+  }
+
+  if(currentMillis - lastNPKRead >= NPK_INTERVAL) {
+    leerNPK();
+    lastNPKRead = currentMillis;
+  }
+
+  if(currentMillis - lastHumedadSueloRead >= SUELO_INTERVAL) {
+    leerHumedadSuelo();
+    controlRele();
+    lastHumedadSueloRead = currentMillis;
+  }
+
+  // Envio de datos
+  if(currentMillis - lastSendBlynk >= BLYNK_INTERVAL) {
+    imprimirEnviarDatos();
+    lastSendBlynk = currentMillis;
+  }
+
+  delay(1500);
+}
+
+// Funcion control del rele + notificaciones
+void setRele(bool estado) {
+  if (releEstado != estado) {
+    releEstado = estado;
+    digitalWrite(pinRele, estado ? HIGH : LOW);
+
+    // Notificacion a Blynk
+    if (estado) {
+      Blynk.logEvent("riego_activado", "Bomba de riego activada!");
     } else {
-      Serial.println("Error lectura DHT11");
-      Blynk.virtualWrite(HUM_AMB_VPIN, 0);
-      Blynk.virtualWrite(TEMP_AMB_VPIN, 0.0);
+      Blynk.logEvent("riego_desantivado", "Bomba de riego detenida!");
     }
   }
-
-  // Leer Nitrógeno
-  if (readSensor(nitrogenoReg)) {
-    nitrogenoValor = (responseFrame[3] << 8) | responseFrame[4];
-    Serial.print("Nitrogeno: ");
-    Serial.print(nitrogenoValor);
-    Serial.println(" mg/kg");
-
-    // ENVIAR A BLYNK
-    Blynk.virtualWrite(NITROGENO_VPIN, nitrogenoValor);
-  }
-  delay(1000);
-
-  // Leer Fósforo
-  if (readSensor(fosforoReg)) {
-    fosforoValor = (responseFrame[3] << 8) | responseFrame[4];
-    Serial.print("Fosforo: ");
-    Serial.print(fosforoValor);
-    Serial.println(" mg/kg");
-
-    // ENVIAR A BLYNK
-    Blynk.virtualWrite(FOSFORO_VPIN, fosforoValor);
-  }
-  delay(1000);
-
-  // Leer Potasio
-  if (readSensor(potasioReg)) {
-    potasioValor = (responseFrame[3] << 8) | responseFrame[4];
-    Serial.print("Potasio: ");
-    Serial.print(potasioValor);
-    Serial.println(" mg/kg");
-
-    // ENVIAR A BLYNK
-    Blynk.virtualWrite(POTASIO_VPIN, potasioValor);
-  }
-
-  // === LLAMAR A LA LECTURA DE HUMEDAD DEL SUELO Y CONTROLAR RELÉ ===
-  leerHumedadSueloYControlarRele();
-
-  delay(3000);  // Espera entre ciclos completos
-  Serial.println("-----------------------");
+  // Actualizar estado en Blynk
+  Blynk.virtualWrite(RELE_STATUS_VPIN, releEstado ? 1 : 0);
 }
 
-// Función para leer el sensor NPK
-bool readSensor(uint16_t reg) {
-  // Construir trama de solicitud
-  requestFrame[0] = sensorAddress;       // Dirección
-  requestFrame[1] = 0x03;                // Función lectura
-  requestFrame[2] = highByte(reg);       // Byte alto del registro
-  requestFrame[3] = lowByte(reg);        // Byte bajo del registro
-  requestFrame[4] = 0x00;                // Cantidad alta (1 registro)
-  requestFrame[5] = 0x01;                // Cantidad baja
-  uint16_t crc = calculateCRC(requestFrame, 6);
-  requestFrame[6] = lowByte(crc);        // CRC bajo
-  requestFrame[7] = highByte(crc);       // CRC alto
-
-  // Enviar solicitud
-  rs485.write(requestFrame, 8);
-  rs485.flush();  // Esperar a que se complete la transmisión
-  delay(100);     // Tiempo para respuesta
-
-  // Recibir respuesta
-  if (rs485.available() >= 7) {
-    rs485.readBytes(responseFrame, 7);
-
-    // Verificar CRC
-    uint16_t recvCRC = (responseFrame[6] << 8) | responseFrame[5];
-    uint16_t calcCRC = calculateCRC(responseFrame, 5);
-    
-    if (calcCRC == recvCRC) {
-      return true;
-    } else {
-      Serial.print("Error CRC: Calculado=0x");
-      Serial.print(calcCRC, HEX);
-      Serial.print(" Recibido=0x");
-      Serial.println(recvCRC, HEX);
-      Blynk.virtualWrite(NITROGENO_VPIN, 0);
-      Blynk.virtualWrite(FOSFORO_VPIN, 0);
-      Blynk.virtualWrite(POTASIO_VPIN, 0);
-    }
-  } else {
-    Serial.print("Error: Datos insuficientes (");
-    Serial.print(rs485.available());
-    Serial.println(" bytes)");
-    Blynk.virtualWrite(NITROGENO_VPIN, 0);
-    Blynk.virtualWrite(FOSFORO_VPIN, 0);
-    Blynk.virtualWrite(POTASIO_VPIN, 0);
-  }
-  return false;
-}
-
-// Función para calcular CRC (Modbus RTU)
-uint16_t calculateCRC(byte *data, uint8_t len) {
-  uint16_t crc = 0xFFFF;
-  for (uint8_t pos = 0; pos < len; pos++) {
-    crc ^= (uint16_t)data[pos];
-    for (uint8_t i = 8; i != 0; i--) {
-      if ((crc & 0x0001) != 0) {
-        crc >>= 1;
-        crc ^= 0xA001;
-      } else {
-        crc >>= 1;
-      }
-    }
-  }
-  return crc;
-}
-
-// Recepcion de valor boton encendido o apagado en Blynk
+// Funcion boton Blynk
 BLYNK_WRITE(RELE_CONTROL_VPIN) {
-  int valor = param.asInt();  // 1 = ON, 0 = OFF
-
-  modoManualRele = (valor == 1);      // Activar modo manual si se activa el botón
-  estadoManualRele = (valor == 1);    // Estado del relé en modo manual
-
-  Serial.print("🔧 Modo manual activado desde Blynk: ");
-  Serial.println(modoManualRele ? "ON" : "OFF");
+  int value = param.asInt();
+  releModoManual = (value == 1);
+  setRele(value);
 }
 
-// Humedad Suelo y Rele
-void leerHumedadSueloYControlarRele() {
-  lecturaRawSuelo = analogRead(sensorSueloPin);  // Valor 0–4095 en ESP32
+// Funcion DHT
+void leerDHT() {
+  Serial.println("\n-------Leyendo DHT11 Sensor-------");
+  hum_amb = dht.readHumidity();
+  temp_amb = dht.readTemperature();
 
-  // Mapeo estimado 4050 (seco) - 1950 (mojado)
-  Serial.print("Valor Raw: ");
-  Serial.println(lecturaRawSuelo);
-  humedadSuelo = map(lecturaRawSuelo, 4050, 1950, 0, 100);
-  humedadSuelo = constrain(humedadSuelo, 0, 100);
-
-  Serial.print("Humedad del suelo: ");
-  Serial.print(humedadSuelo);
-  Serial.println(" %");
-
-  // Enviar a Blynk
-  Blynk.virtualWrite(HUMEDAD_SUELO_VPIN, humedadSuelo);
-
-  if (!modoManualRele) {
-    // Modo automático
-    if (humedadSuelo < 60) {
-      digitalWrite(pinRele, HIGH);
-      Serial.println("Relé ACTIVADO (automático)");
-    } else {
-      digitalWrite(pinRele, LOW);
-      Serial.println("Relé DESACTIVADO (automático)");
-    }
-  } else {
-    // Modo manual, respetar el estado solicitado por Blynk
-    digitalWrite(pinRele, estadoManualRele ? HIGH : LOW);
-    Serial.print("Relé en modo MANUAL: ");
-    Serial.println(estadoManualRele ? "ON" : "OFF");
+  if (isnan(hum_amb) || isnan(temp_amb)) {
+    Serial.println("Error lectura DHT11");
+    hum_amb = -1;
+    temp_amb = -1;
   }
+}
+
+// Funcion NPK
+void leerNPK() {
+  Serial.println("-------Leyendo NPK Sensor-------");
+  // Envio de datos al NPK
+  SerialPort.write(npkTabla, sizeof(npkTabla));
+  Serial.print("Enviando: ");
+  printFrame(npkTabla, 8);
+  delay(100);
+
+  if (SerialPort.available() >= 11) {
+    // Leyendo la respuesta
+    uint8_t npkRespuesta[11];
+    SerialPort.readBytes(npkRespuesta, sizeof(npkRespuesta));
+    Serial.print("Recibido: ");
+    printFrame(npkRespuesta, 11);
+
+    // Extrayendo valores N, P, K de la respuesta recibida
+    nitrogeno = (npkRespuesta[3] << 8) | npkRespuesta[4];
+    fosforo = (npkRespuesta[5] << 8) | npkRespuesta[6];
+    potasio = (npkRespuesta[7] << 8) | npkRespuesta[8];
+  } else {
+    Serial.println("Error NPK: Sin respuesta");
+    nitrogeno = fosforo = potasio = 0;
+  }
+}
+
+// Función para imprimir tramas en hexadecimal
+void printFrame(byte *frame, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++) {
+    if (frame[i] < 0x10) Serial.print("0");
+    Serial.print(frame[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+// Funcion Humedad del suelo
+void leerHumedadSuelo() {
+  Serial.println("-------Leyendo Humedad Suelo-------");
+  lecturaRawSuelo = analogRead(sensorSueloPin); // Lee de 0 a 4095
+  Serial.print("Valor Raw Suelo: ");
+  Serial.println(lecturaRawSuelo);
+
+  // Detectar si el sensor esta desconectado
+  if (lecturaRawSuelo <= 100 || lecturaRawSuelo >= 4000) {
+    humedadSueloConectado = false;
+    humedadSuelo = -1;
+
+    //Notificar solo en la primera deteccion
+    static bool notificado = false;
+    if (!notificado) {
+      Serial.println("ALERTA: Sensor de humedad desconectado");
+      Blynk.logEvent("sensor_desconectado", "Sensor de humedad del suelo desconectado");
+      notificado = true;
+    }
+    return;
+  }
+
+  humedadSueloConectado = true;
+  // Mapear: 3300 (seco) => 0%, 2100 (mojado) => 100%
+  humedadSuelo = map(lecturaRawSuelo, 3300, 2100, 0, 100);
+  humedadSuelo = constrain(humedadSuelo, 0, 100);
+}
+
+// Funcion modulo rele
+void controlRele() {
+  Serial.println("-------Control de Rele-------");
+
+  // Forzar apagado si el sensor esta desconectado
+  if (!releModoManual && !humedadSueloConectado) {
+    setRele(false);
+    return;
+  }
+
+  //Control automatico si el sensor esta conectado
+  if (!releModoManual) {  // solo en modo automatico
+    Serial.println("Modo Automatico");
+    if (humedadSuelo < 40 && !releEstado) {
+      setRele(true);
+    } else if (humedadSuelo >= 60 && releEstado) {
+      setRele(false);
+    }
+  }
+  if (releModoManual == 1) Serial.println("Modo Manual");
+}
+
+// Envio e Impresion de datos
+void imprimirEnviarDatos() {
+  // Serial Monitor
+  Serial.println("\n=====Datos Sensores Recibidos=====");
+  Serial.print("Temperatura Ambiental: ");
+  Serial.print(temp_amb);
+  Serial.println("°C");
+  Serial.print("Humedad Ambiental: ");
+  Serial.print(hum_amb);
+  Serial.println("%");
+
+  Serial.print("Nitrogeno: ");
+  Serial.println(nitrogeno);
+  Serial.print("Fosforo: ");
+  Serial.println(fosforo);
+  Serial.print("Potasio: ");
+  Serial.println(potasio);
+
+  Serial.print("Humedad Suelo: ");
+  Serial.print(humedadSuelo);
+  Serial.println("%");
+
+  Serial.print("Estado Riego: ");
+  Serial.println(releEstado ? "Activado" : "Desactivado");
+  Serial.println("_______________");
+
+  // Blynk
+  Blynk.virtualWrite(TEMP_AMB_VPIN, temp_amb);
+  Blynk.virtualWrite(HUM_AMB_VPIN, hum_amb);
+  Blynk.virtualWrite(NITROGENO_VPIN, nitrogeno);
+  Blynk.virtualWrite(FOSFORO_VPIN, fosforo);
+  Blynk.virtualWrite(POTASIO_VPIN, potasio);
+  Blynk.virtualWrite(HUMEDAD_SUELO_VPIN, humedadSuelo);
 }
